@@ -40,7 +40,7 @@ pip install torch pennylane yfinance scikit-learn matplotlib seaborn pandas nump
 Simply run the main script:
 
 ```bash
-python quantum_stock_predictor.py
+pipeline.py
 ```
 
 The script will:
