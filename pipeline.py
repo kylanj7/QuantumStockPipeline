@@ -12,6 +12,8 @@ from sklearn.preprocessing import MinMaxScaler
 import pennylane as qml
 import os
 from tqdm import tqdm
+import multiprocessing as mp
+from joblib import Parallel, delayed
 
 # Check for GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -25,15 +27,16 @@ if torch.cuda.is_available():
 
 # Define constants
 TICKER = "NVDA"          # Stock symbol
-LOOKBACK = 30            # Days to look back
+LOOKBACK = 60            # Days to look back (increased for better pattern capture)
 EPOCHS = 50              # Training epochs
-BATCH_SIZE = 16          # Batch size
+BATCH_SIZE = 64          # Batch size (increased for better GPU utilization)
 LEARNING_RATE = 0.001    # Learning rate
 TRAIN_SPLIT = 0.8        # Train/test split
-N_QUBITS = 4             # Number of qubits
-N_LAYERS = 2             # Number of quantum layers
-HIDDEN_SIZE = 64         # LSTM hidden size
+N_QUBITS = 10            # Number of qubits (increased for better expressivity)
+N_LAYERS = 3             # Number of quantum layers
+HIDDEN_SIZE = 128        # LSTM hidden size (increased for better capacity)
 OUTPUT_DIR = "outputs"   # Output directory
+NUM_WORKERS = mp.cpu_count()  # Use all available CPU cores for multiprocessing
 
 # Create output directory if it doesn't exist
 if not os.path.exists(OUTPUT_DIR):
@@ -42,6 +45,28 @@ if not os.path.exists(OUTPUT_DIR):
 # Set up plotting style
 sns.set(style='whitegrid')
 plt.rcParams['figure.figsize'] = (12, 6)
+
+# Function to get the best available quantum device
+def get_best_quantum_device(n_qubits):
+    """Returns the fastest available quantum device"""
+    try:
+        # Try GPU device first
+        dev = qml.device("lightning.gpu", wires=n_qubits)
+        print("Using GPU-accelerated quantum simulation")
+        return "lightning.gpu"
+    except Exception as e:
+        try:
+            # Try lightning.qubit (CPU but faster than default)
+            dev = qml.device("lightning.qubit", wires=n_qubits)
+            print("Using lightning.qubit for quantum simulation")
+            return "lightning.qubit"
+        except:
+            # Fall back to default
+            print("Using default.qubit for quantum simulation")
+            return "default.qubit"
+
+# Get the best available quantum device
+QUANTUM_DEVICE = get_best_quantum_device(N_QUBITS)
 
 # Define Dataset class
 class TimeSeriesDataset(Dataset):
@@ -53,7 +78,7 @@ class TimeSeriesDataset(Dataset):
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
 
-# Alternative QLayer implementation that avoids TorchLayer initialization issues
+# Define Quantum Layer with multiprocessing support
 class QLayer(nn.Module):
     def __init__(self, n_qubits=N_QUBITS, n_layers=N_LAYERS):
         super(QLayer, self).__init__()
@@ -64,13 +89,13 @@ class QLayer(nn.Module):
         self.weights = nn.Parameter(torch.randn(n_layers, n_qubits, 3) * 0.1)
         
         # Create quantum device
-        self.dev = qml.device("default.qubit", wires=n_qubits)
+        self.dev = qml.device(QUANTUM_DEVICE, wires=n_qubits)
         
-    def forward(self, x):
-        batch_size = x.shape[0]
-        processed_data = torch.zeros(batch_size, self.n_qubits, device=x.device)
+        # Create a process pool for parallel processing
+        self.n_workers = min(8, NUM_WORKERS)  # Limit to 8 workers to avoid overhead
         
-        # Define the quantum circuit function
+    def process_quantum_circuit(self, input_data, weights_np):
+        """Process a single quantum circuit for one input sample"""
         @qml.qnode(self.dev)
         def circuit(inputs, weights):
             # Encode inputs
@@ -91,24 +116,40 @@ class QLayer(nn.Module):
             
             # Measurements
             return [qml.expval(qml.PauliZ(j)) for j in range(self.n_qubits)]
+            
+        return circuit(input_data, weights_np)
         
-        # Process each batch element
+    def forward(self, x):
+        batch_size = x.shape[0]
+        processed_data = torch.zeros(batch_size, self.n_qubits, device=x.device)
+        
+        # Move data to CPU for multiprocessing
+        inputs_list = []
         for i in range(batch_size):
-            # Prepare inputs
             if x.shape[1] >= self.n_qubits:
                 inputs = x[i, :self.n_qubits].detach().cpu().numpy()
             else:
-                inputs = torch.zeros(self.n_qubits)
-                inputs[:x.shape[1]] = x[i]
-                inputs = inputs.detach().cpu().numpy()
+                inputs = np.zeros(self.n_qubits)
+                inputs[:x.shape[1]] = x[i].detach().cpu().numpy()
+            inputs_list.append(inputs)
             
-            # Run circuit
-            weights_np = self.weights.detach().cpu().numpy()
-            result = circuit(inputs, weights_np)
-            
-            # Store results
-            processed_data[i] = torch.tensor(result, device=x.device)
+        weights_np = self.weights.detach().cpu().numpy()
         
+        # Process quantum circuits in parallel using joblib
+        if batch_size > 1 and self.n_workers > 1:
+            results = Parallel(n_jobs=self.n_workers)(
+                delayed(self.process_quantum_circuit)(inputs_list[i], weights_np) 
+                for i in range(batch_size)
+            )
+        else:
+            # Sequential processing for small batches or single worker
+            results = [self.process_quantum_circuit(inputs_list[i], weights_np) 
+                      for i in range(batch_size)]
+        
+        # Convert results back to tensor
+        for i, result in enumerate(results):
+            processed_data[i] = torch.tensor(result, device=x.device)
+            
         return processed_data
 
 # Define Quantum LSTM Cell
@@ -118,7 +159,7 @@ class QLSTMCell(nn.Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
         
-        # Quantum layers for gates - FIXED: added parentheses
+        # Quantum layers for gates
         self.forget_quantum = QLayer()
         self.input_quantum = QLayer()
         self.output_quantum = QLayer()
@@ -167,46 +208,64 @@ class QLSTMCell(nn.Module):
         
         return h_next, c_next
 
-# Define full QLSTM model
-class QLSTM(nn.Module):
+# Define hybrid classical-quantum LSTM model
+class HybridQLSTM(nn.Module):
     def __init__(self, input_size, hidden_size, num_layers=1, output_size=1):
-        super(QLSTM, self).__init__()
+        super(HybridQLSTM, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         
-        # QLSTM cells
+        # Classical LSTM for efficient GPU processing
+        self.classical_lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
+        
+        # Quantum LSTM cell for enhanced feature extraction
         self.cells = nn.ModuleList([
             QLSTMCell(
-                input_size if i == 0 else hidden_size,
+                hidden_size if i == 0 else hidden_size,
                 hidden_size
             )
             for i in range(num_layers)
         ])
         
         # Output layer
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.fc = nn.Linear(hidden_size * 2, hidden_size)
+        self.output = nn.Linear(hidden_size, output_size)
     
     def forward(self, x):
         # Get dimensions
         batch_size, seq_len, _ = x.size()
         
-        # Initialize hidden states
+        # Run classical LSTM (efficient on GPU)
+        classical_out, (h_n, c_n) = self.classical_lstm(x)
+        classical_features = h_n.squeeze(0)
+        
+        # Initialize quantum LSTM states
         h = [torch.zeros(batch_size, self.hidden_size, device=x.device) for _ in range(self.num_layers)]
         c = [torch.zeros(batch_size, self.hidden_size, device=x.device) for _ in range(self.num_layers)]
         
-        # Process sequence
-        for t in range(seq_len):
-            x_t = x[:, t, :]
+        # Only process the last timestep with quantum LSTM for efficiency
+        x_last = classical_out[:, -1, :]
+        
+        # Process through quantum LSTM cells
+        for i in range(self.num_layers):
+            if i > 0:
+                x_last = h[i-1]
             
-            for i in range(self.num_layers):
-                if i > 0:
-                    x_t = h[i-1]
-                
-                h[i], c[i] = self.cells[i](x_t, (h[i], c[i]))
+            h[i], c[i] = self.cells[i](x_last, (h[i], c[i]))
+        
+        # Combine classical and quantum features
+        combined = torch.cat((classical_features, h[-1]), dim=1)
         
         # Final prediction
-        out = self.fc(h[-1])
+        hidden = torch.relu(self.fc(combined))
+        out = self.output(hidden)
+        
         return out
 
 # Function to fetch stock data
@@ -248,7 +307,7 @@ def prepare_data(data, lookback=30, train_split=0.8):
     
     return X_train, y_train, X_test, y_test, scaler
 
-# Function to train model
+# Function to train model with progress bar
 def train_model(model, train_loader, test_loader, optimizer, criterion, epochs=50):
     train_losses = []
     test_losses = []
@@ -258,7 +317,7 @@ def train_model(model, train_loader, test_loader, optimizer, criterion, epochs=5
         model.train()
         train_loss = 0.0
         
-        # Added progress bar
+        # Progress bar for tracking training
         for X_batch, y_batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False):
             # Forward pass
             outputs = model(X_batch)
@@ -294,7 +353,7 @@ def train_model(model, train_loader, test_loader, optimizer, criterion, epochs=5
     
     return train_losses, test_losses
 
-# Function to predict future prices
+# Function to predict future prices using multiprocessing
 def predict_future(model, last_sequence, scaler, prediction_days=30):
     model.eval()
     predictions = []
@@ -304,24 +363,47 @@ def predict_future(model, last_sequence, scaler, prediction_days=30):
     if current_sequence.device != torch.device('cpu'):
         current_sequence = current_sequence.cpu()
     
-    # Make predictions
-    for _ in range(prediction_days):
+    # Define prediction function for each step
+    def predict_single_step(seq):
         with torch.no_grad():
             # Prepare input
-            current_sequence_gpu = current_sequence.unsqueeze(0).to(device)
+            seq_gpu = seq.unsqueeze(0).to(device)
             # Get prediction
-            pred = model(current_sequence_gpu)
-            pred = pred.cpu().item()
-            
-            # Store prediction
+            pred = model(seq_gpu)
+            return pred.cpu().item()
+    
+    # Process first prediction sequentially
+    pred = predict_single_step(current_sequence)
+    predictions.append(pred)
+    
+    # Update sequence for next prediction
+    new_sequence = current_sequence.clone()
+    new_sequence[:-1] = current_sequence[1:]
+    new_sequence[-1, 3] = pred  # Update close price
+    current_sequence = new_sequence
+    
+    # Create batch of sequences for remaining predictions
+    future_sequences = []
+    for _ in range(prediction_days - 1):
+        future_sequences.append(current_sequence.clone())
+        
+        # Update sequence for next step
+        new_sequence = current_sequence.clone()
+        new_sequence[:-1] = current_sequence[1:]
+        new_sequence[-1, 3] = pred  # Use last prediction
+        current_sequence = new_sequence
+    
+    # Use multiprocessing for the remaining predictions if we have multiple days
+    if len(future_sequences) > 1 and NUM_WORKERS > 1:
+        batch_preds = Parallel(n_jobs=min(NUM_WORKERS, len(future_sequences)))(
+            delayed(predict_single_step)(seq) for seq in future_sequences
+        )
+        predictions.extend(batch_preds)
+    else:
+        # Sequential processing for few predictions
+        for seq in future_sequences:
+            pred = predict_single_step(seq)
             predictions.append(pred)
-            
-            # Update sequence for next prediction
-            new_sequence = current_sequence.clone()
-            new_sequence[:-1] = current_sequence[1:]
-            new_sequence[-1, 3] = pred  # Update close price
-            
-            current_sequence = new_sequence
     
     # Convert to actual prices
     pred_array = np.zeros((len(predictions), 5))
@@ -332,11 +414,19 @@ def predict_future(model, last_sequence, scaler, prediction_days=30):
     
     return inverse_predictions
 
-# Function to calculate future dates
+# Function to calculate future dates (fixed to generate exact number of business days)
 def calculate_future_dates(start_date, num_days):
-    dates = [start_date + timedelta(days=i) for i in range(num_days)]
-    business_dates = [date for date in dates if date.weekday() < 5]
-    return business_dates[:num_days]
+    """Generate exactly num_days business dates (excluding weekends)"""
+    business_dates = []
+    current_date = start_date
+    
+    # Keep adding dates until we have enough business days
+    while len(business_dates) < num_days:
+        if current_date.weekday() < 5:  # Is a weekday (0-4 = Monday-Friday)
+            business_dates.append(current_date)
+        current_date += timedelta(days=1)
+    
+    return business_dates
 
 # Main function
 def main():
@@ -350,12 +440,15 @@ def main():
     train_dataset = TimeSeriesDataset(X_train, y_train)
     test_dataset = TimeSeriesDataset(X_test, y_test)
     
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    # Use multiple workers for data loading
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
+                             num_workers=min(4, NUM_WORKERS))
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=min(4, NUM_WORKERS))
     
     # Initialize model
     input_size = X_train.shape[2]  # Number of features
-    model = QLSTM(input_size=input_size, hidden_size=HIDDEN_SIZE, num_layers=1, output_size=1)
+    model = HybridQLSTM(input_size=input_size, hidden_size=HIDDEN_SIZE, num_layers=1, output_size=1)
     model = model.to(device)
     
     # Initialize optimizer and loss
@@ -397,19 +490,28 @@ def main():
     pred_prices = scaler.inverse_transform(pred_array)[:, 3]
     actual_prices = scaler.inverse_transform(actual_array)[:, 3]
     
+    # Calculate prediction metrics
+    mse = np.mean((pred_prices - actual_prices) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(pred_prices - actual_prices))
+    print(f"Test MSE: {mse:.4f}, RMSE: {rmse:.4f}, MAE: {mae:.4f}")
+    
     # Plot predictions vs actual
     plt.figure(figsize=(14, 7))
     plt.plot(actual_prices, label='Actual Prices', alpha=0.7)
     plt.plot(pred_prices, label='Predicted Prices', alpha=0.7)
     plt.xlabel('Days')
     plt.ylabel('Price (USD)')
-    plt.title(f'{TICKER} Stock Price Prediction')
+    plt.title(f'{TICKER} Stock Price Prediction - Test Data')
     plt.legend()
     plt.savefig(os.path.join(OUTPUT_DIR, 'prediction_vs_actual.png'))
     plt.close()
     
     # Predict future prices
     last_sequence = X_test[-1]
+    
+    # Store all predictions for comparison
+    all_predictions = {}
     
     # Different time frames for prediction
     future_days = {
@@ -427,14 +529,21 @@ def main():
     # Make predictions for each time frame
     print("\nFuture price predictions:")
     for period, days in future_days.items():
-        predictions = predict_future(model, last_sequence, scaler, days)
+        print(f"Predicting {period} prices ({days} days)...")
         
-        # Calculate dates
+        # Predict prices
+        predictions = predict_future(model, last_sequence, scaler, days)
+        all_predictions[period] = predictions
+        
+        # Calculate business dates (excluding weekends)
         future_dates = calculate_future_dates(today, days)
+        
+        # Ensure arrays have matching dimensions
+        assert len(future_dates) == len(predictions), f"Mismatch in dimensions: dates {len(future_dates)}, predictions {len(predictions)}"
         
         # Plot predictions
         plt.figure(figsize=(14, 7))
-        plt.plot(future_dates, predictions, label=f'Predicted Prices ({period})*- coding: utf-8 -*-', alpha=0.7)
+        plt.plot(future_dates, predictions, label=f'Predicted Prices ({period})', alpha=0.7)
         plt.xlabel('Date')
         plt.ylabel('Price (USD)')
         plt.title(f'{TICKER} Stock Price Prediction ({period})')
@@ -448,7 +557,81 @@ def main():
         last_day_pred = predictions[-1]
         print(f"{period.capitalize()} prediction (on {future_dates[-1].strftime('%Y-%m-%d')}): ${last_day_pred:.2f}")
     
+    # Create a comprehensive dashboard
+    create_performance_dashboard(train_losses, test_losses, actual_prices, pred_prices, all_predictions)
+    
     print("\nAnalysis complete! Check the 'outputs' folder for visualizations.")
+
+# Function to create a comprehensive performance dashboard
+def create_performance_dashboard(train_losses, test_losses, actual_prices, pred_prices, future_predictions):
+    """Creates a comprehensive performance dashboard with multiple plots"""
+    fig = plt.figure(figsize=(20, 15))
+    
+    # 1. Training metrics
+    ax1 = fig.add_subplot(321)
+    ax1.plot(train_losses, label='Training Loss')
+    ax1.plot(test_losses, label='Validation Loss')
+    ax1.set_xlabel('Epochs')
+    ax1.set_ylabel('Loss')
+    ax1.set_title('Training and Validation Loss')
+    ax1.legend()
+    
+    # 2. Prediction vs Actual
+    ax2 = fig.add_subplot(322)
+    ax2.plot(actual_prices, label='Actual Prices', alpha=0.7)
+    ax2.plot(pred_prices, label='Predicted Prices', alpha=0.7)
+    ax2.set_xlabel('Days')
+    ax2.set_ylabel('Price (USD)')
+    ax2.set_title(f'{TICKER} Stock Price Prediction')
+    ax2.legend()
+    
+    # 3. Error distribution
+    ax3 = fig.add_subplot(323)
+    errors = pred_prices - actual_prices
+    ax3.hist(errors, bins=20)
+    ax3.set_xlabel('Prediction Error')
+    ax3.set_ylabel('Frequency')
+    ax3.set_title('Error Distribution')
+    
+    # 4. Future predictions comparison
+    ax4 = fig.add_subplot(324)
+    for period, predictions in future_predictions.items():
+        if period in ['month', '3month', '6month']:
+            ax4.plot(predictions[:30], label=f'{period}')
+    ax4.set_xlabel('Days')
+    ax4.set_ylabel('Price (USD)')
+    ax4.set_title('Future Price Projections (First 30 Days)')
+    ax4.legend()
+    
+    # 5. Prediction accuracy by day
+    ax5 = fig.add_subplot(325)
+    errors_by_day = np.abs(pred_prices - actual_prices)
+    days = np.arange(len(errors_by_day))
+    ax5.scatter(days, errors_by_day, alpha=0.5)
+    ax5.set_xlabel('Day Index')
+    ax5.set_ylabel('Absolute Error')
+    ax5.set_title('Prediction Accuracy by Day')
+    
+    # 6. Performance metrics table
+    ax6 = fig.add_subplot(326)
+    ax6.axis('off')
+    metrics = {
+        'Metric': ['MSE', 'MAE', 'RMSE', 'R²'],
+        'Value': [
+            np.mean((pred_prices - actual_prices)**2),
+            np.mean(np.abs(pred_prices - actual_prices)),
+            np.sqrt(np.mean((pred_prices - actual_prices)**2)),
+            1 - np.sum((pred_prices - actual_prices)**2) / np.sum((actual_prices - np.mean(actual_prices))**2)
+        ]
+    }
+    ax6.table(cellText=[[m, f'{v:.4f}'] for m, v in zip(metrics['Metric'], metrics['Value'])],
+              colLabels=['Metric', 'Value'],
+              loc='center')
+    ax6.set_title('Performance Metrics')
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUTPUT_DIR, 'performance_dashboard.png'))
+    plt.close()
 
 # Run the main function
 if __name__ == "__main__":
